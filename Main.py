@@ -48,10 +48,7 @@ from idautils import *
 from idc import *
 
 # HADESE internal imports
-from Utils import *
-
 from triton import *
-
 
 # Configuration Settings
 Debug_Level = 2
@@ -73,6 +70,29 @@ USER_DEFINED_ADDR = []
 
 GOOD_BRANCH = {}
 
+
+'''
+Path data structure
+1. path [path][function][block] -> selected
+2. path [path][function][block][instruction] -> not necessary
+
+[ ex: path from main+0x77 to socket() ]
+[0] [function 0]    [block 0] 
+                    [block 1] -> socket()
+    
+    [function 1]    [block 0]   
+                    [block 1]
+    [function 2]    [block 0]
+                    [block 1]
+                    [block 2]
+        ...
+    [function 8]    [block 0]
+                    [block 1]
+                        ...
+                    [block 5] -> main+0x77
+[1] [function 0]    [block 0]
+        ...
+'''
 
 ctx = TritonContext()
 astCtxt = ctx.getAstContext()
@@ -215,30 +235,6 @@ def emulate(Triton, pc):
     print '[+] Emulation done.'
     return
 
-
-'''
-Path data structure
-1. path [path][function][block] -> selected
-2. path [path][function][block][instruction] -> not necessary
-
-[ ex: path from main+0x77 to socket() ]
-[0] [function 0]    [block 0] 
-                    [block 1] -> socket()
-    
-    [function 1]    [block 0]   
-                    [block 1]
-    [function 2]    [block 0]
-                    [block 1]
-                    [block 2]
-        ...
-    [function 8]    [block 0]
-                    [block 1]
-                        ...
-                    [block 5] -> main+0x77
-[1] [function 0]    [block 0]
-        ...
-'''
-
 # utility functions
 
 
@@ -265,6 +261,106 @@ def debug(message, level):
     '''
     if level <= Debug_Level:
         print "[debug] " + message
+
+
+class DbgImports():
+    """
+    DbgImports contains the names, ordinals and addresses of all imported functions as allocated at runtime.
+    """
+
+    def __init__(self):
+        """
+        Ctor
+        """
+        # self.logger = logging.getLogger(__name__)
+        self.current_module_name = None
+
+        # Real-Time import table
+        # (Key -> Real func adrs.  Value -> (module_name, ea, name, ord)}
+        self.rt_import_table = {}
+
+    def getImportTableData(self):
+        """
+        Update rt_import_table with current import table data.
+        """
+
+        def imp_cb(ea, name, ord):
+            """
+            Import enumeration callback function. used by idaapi.enum_import_names .
+            """
+
+            tmpImports.append([self.current_module_name, ea, name, ord])
+            return True
+
+        # Contains static import table data (w\o real function addresses)
+        tmpImports = []
+        imp_num = idaapi.get_import_module_qty()  # Number of imported modules
+
+        for i in xrange(0, imp_num):
+            self.current_module_name = idaapi.get_import_module_name(i).lower()
+            idaapi.enum_import_names(i, imp_cb)
+
+        #  Get runtime function addresses and store in self.rt_import_table
+        if not idaapi.is_debugger_on():
+            raise RuntimeError("Debugger is not currently active.")
+
+        for module_name, ea, name, ord in tmpImports:
+            func_real_adrs = get_adrs_mem(ea)
+            self.rt_import_table[func_real_adrs] = (module_name, ea, name, ord)
+
+    def find_func_iat_adrs(self, ea):
+        """
+        Find the function location in the IAT table based on its runtime address
+        @param ea: effective address of the function
+        @return: a tuple of ('EA at the IAT' , 'Moudle Name')
+        """
+        if ea in self.rt_import_table:
+            (module_name, iat_ea, name, ord) = self.rt_import_table[ea]
+            return iat_ea, module_name
+
+        return None, None
+
+    def is_func_imported(self, ea):
+        """
+        Checks the given ea and returns True if the function is an imported function (loacted in IAT)
+        """
+        # If address is located in IAT
+        if ea in self.rt_import_table:
+            return True
+
+        return False
+
+    def is_func_module(self, ea, mod_name):
+        """
+        Check if function at ea is part of the imported module
+        """
+        if ea in self.rt_import_table:
+            (module, ea, name, ord) = self.rt_import_table[ea]
+            if module == mod_name:
+                return True
+
+        return False
+
+    def is_loaded_module(self, module_name):
+        """
+        Check if module has loaded functions in the IAT
+        @param module_name: Name of the module to search
+        @return: True if model name is found in IAT, otherwise False
+        """
+
+        for (module, ea, name, ord) in self.rt_import_table.values():
+            if module == module_name:
+                return True
+            return False
+
+    def print_debug_imports(self):
+        """
+        Print the debug imports
+        """
+        for dbgImp in self.rt_import_table:
+            (module_name, ea, name, ord) = self.rt_import_table[dbgImp]
+            idaapi.msg("ModuleName - %s,\t\tFunctionName - %s,\t\t Address in IAT - %s,\t\t Real address - %s\n" %
+                       (module_name, name, hex(ea), hex(dbgImp)))
 
 
 def imp_callback(ea, name, ord):
@@ -306,7 +402,8 @@ def explore_path(src_ea, dst_ea):
         fnc_addr = LocByName(fnc_name)
 
         print "Finding Path from %s to %s" % (GetFunctionName(src_ea), fnc_name)
-        pf = pathfinder.FunctionPathFinder(fnc_addr)
+        # pathfinder = PathFinder(fnc_addr)
+        pf = FunctionPathFinder(fnc_addr)
         results = pf.paths_from(src_ea)
 
         if not results:
@@ -342,7 +439,7 @@ def explore_path(src_ea, dst_ea):
                 # print "[!] Entering %s [0x%x] at [0x%x]" % (function_name,
                 # function_addr, xref.frm)
 
-                pb = pathfinder.BlockPathFinder(xref.frm)
+                pb = BlockPathFinder(xref.frm)
                 pb_results = pb.paths_from(function_addr)
                 # print pb_results
                 # block_list = map(hex, pb_results)
@@ -352,12 +449,13 @@ def explore_path(src_ea, dst_ea):
                 '''
                 GOOD_BRANCH[hex(xref.frm).rstrip(
                     "L")] = hex(cur_ea).rstrip("L")
-                print GOOD_BRANCH
+                # print GOOD_BRANCH
 
                 for pb_result in pb_results:
                     for pb_res in pb_result:
-                        print "STT: " + hex((pb.LookupBlock(pb_res)).startEA).rstrip("L")
-                        print "END: " + hex((pb.LookupBlock(pb_res)).endEA).rstrip("L")
+                        # print "STT: " + hex((pb.LookupBlock(pb_res)).startEA).rstrip("L")
+                        # print "END: " +
+                        # hex((pb.LookupBlock(pb_res)).endEA).rstrip("L")
                         idc.SetColor(pb_res, idc.CIC_ITEM, COLOR_BLOCK)
                         block_list.append(hex(pb_res).rstrip("L"))
                         # print "[block] 0x%x" % pb_res
@@ -622,7 +720,7 @@ class FunctionPathFinder(PathFinder):
         '''
         xrefs = []
 
-        for x in idautils.XrefsTo(node):
+        for x in XrefsTo(node):
             if x.type != idaapi.fl_F:
                 f = idaapi.get_func(x.frm)
                 if f and f.startEA not in xrefs:
@@ -677,7 +775,7 @@ class BlockPathFinder(PathFinder):
 
         block = self.LookupBlock(node)
         if block:
-            for xref in idautils.XrefsTo(block.startEA):
+            for xref in XrefsTo(block.startEA):
                 xref_block = self.LookupBlock(xref.frm)
                 if xref_block and xref_block.startEA not in xrefs:
                     xrefs.append(xref_block.startEA)
